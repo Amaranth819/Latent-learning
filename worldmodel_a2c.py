@@ -1,3 +1,4 @@
+from turtle import forward
 import torch
 import torch.nn as nn
 import numpy as np
@@ -272,7 +273,7 @@ class WorldModelA2C(nn.Module):
         self.obs_recon_net = nn.Sequential(
             nn.Linear(state_dim * 2, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, obs_dim)
+            nn.Linear(hidden_dim, obs_dim * 2)
         )
 
         self.actor = nn.Sequential(
@@ -286,34 +287,72 @@ class WorldModelA2C(nn.Module):
         self.critic = nn.Sequential(
             nn.Linear(state_dim * 2, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, 2)
         )
 
 
-    def actor_critic(self, z_t, deterministic = False):
+    # def actor_critic(self, z_t, deterministic = False):
+    #     a_mu = self.actor(z_t)
+    #     # a_dist = torch.distributions.Normal(a_mu, self.fixed_action_std)
+    #     a_dist = torch.distributions.Independent(torch.distributions.Normal(a_mu, self.fixed_action_std), 1)
+    #     a = a_mu if deterministic else a_dist.sample()   
+    #     a_logprob = a_dist.log_prob(a)
+    #     v = self.critic(z_t).squeeze(-1)
+    #     return a_dist, a, a_logprob, v
+
+
+    def actor_forward(self, z_t, a = None, deterministic = False):
         a_mu = self.actor(z_t)
-        a_dist = torch.distributions.Normal(a_mu, self.fixed_action_std)
-        a = a_mu if deterministic else a_dist.sample()   
-        a_logprob = a_dist.log_prob(a).sum(-1)
-        v = self.critic(z_t).squeeze(-1)
-        return a_dist, a, a_logprob, v
+        a_dist = torch.distributions.Independent(torch.distributions.Normal(a_mu, self.fixed_action_std), 1)
+        if a is not None:
+            a_logprob = a_dist.log_prob(a)
+            return None, a_logprob, a_dist.entropy()
+        else:
+            a = a_mu if deterministic else a_dist.sample()   
+            a_logprob = a_dist.log_prob(a)
+            return a, a_logprob, a_dist.entropy()
+
+
+    def critic_forward(self, z_t, v = None):
+        x = self.critic(z_t)
+        mu, std = torch.chunk(x, 2, -1) 
+        std = torch.sigmoid(std) + 0.01
+        v_dist = torch.distributions.Independent(torch.distributions.Normal(mu.squeeze(-1), std.squeeze(-1)), 1)
+        if v is not None:
+            v_logprob = v_dist.log_prob(v)
+            return None, v_logprob
+        else:
+            v = v_dist.sample()
+            v_logprob = v_dist.log_prob(v)
+            return v, v_logprob
+
+
+    def obs_recon_forward(self, z_t, obs):
+        x = self.obs_recon_net(z_t)
+        mu, std = torch.chunk(x, 2, -1)
+        std = torch.sigmoid(std) + 0.01
+        obs_dist = torch.distributions.Independent(torch.distributions.Normal(mu, std), 1)
+        obs_logprob = obs_dist.log_prob(obs)
+        return obs_logprob
 
 
     def step(self, o_curr, a_prev, h_prev, s_prev, deterministic = False):
         posterior, (h_curr, s_curr) = self.rssm.posterior_forward(s_prev, a_prev, o_curr, h_prev)
         z_curr = torch.cat([h_curr, s_curr], -1)
-        _, a, a_logprob, v = self.actor_critic(z_curr, deterministic)
+        a, a_logprob, _ = self.actor_forward(z_curr, deterministic = deterministic)
+        v, _ = self.critic_forward(z_curr)
         return posterior, a, a_logprob, v, (h_curr, s_curr)
 
 
-    def forward(self, batch_obs_curr, batch_act_prev):
+    def forward(self, batch_obs_curr, batch_act_prev, batch_returns):
         bs = batch_obs_curr.size(1)
         h_t, s_t = self.rssm.init_states(bs)
         features, priors, posteriors = self.rssm(batch_obs_curr, batch_act_prev, h_t, s_t)
-        recon_obs_curr = self.obs_recon_net(features)
-        batch_a_dist, _, _, batch_v_pred = self.actor_critic(features)
-        batch_a_logprob = batch_a_dist.log_prob(batch_act_prev).sum(-1)
-        return features, priors, posteriors, recon_obs_curr, batch_a_dist, batch_a_logprob, batch_v_pred
+        batch_recon_obs_logprob = self.obs_recon_forward(features, batch_obs_curr)
+        _, batch_a_logprob, batch_a_entropy = self.actor_forward(features, batch_act_prev)
+        _, batch_v_logprob = self.critic_forward(features, batch_returns)
+
+        return features, priors, posteriors, batch_recon_obs_logprob, batch_a_logprob, batch_a_entropy, batch_v_logprob
 
 
     def get_parameter_dict(self):
@@ -325,130 +364,75 @@ class WorldModelA2C(nn.Module):
 
 
 
-def plot_grad_flow(named_parameters):
-    '''Plots the gradients flowing through different layers in the net during training.
-    Can be used for checking for possible gradient vanishing / exploding problems.
-    
-    Usage: Plug this function in Trainer class after loss.backwards() as 
-    "plot_grad_flow(self.model.named_parameters())" to visualize the gradient flow'''
-    ave_grads = []
-    max_grads= []
-    layers = []
-    for n, p in named_parameters:
-        if(p.requires_grad) and ("bias" not in n):
-            layers.append(n)
-            ave_grads.append(p.grad.abs().mean())
-            max_grads.append(p.grad.abs().max())
 
-    plt.bar(np.arange(len(max_grads)), max_grads, alpha = 1, lw = 1, color="c")
-    plt.bar(np.arange(len(max_grads)), ave_grads, alpha = 1, lw = 1, color="b")
-    plt.hlines(0, 0, len(ave_grads) + 1, lw = 2, color="k")
-    plt.xticks(range(0, len(ave_grads), 1), layers, rotation="vertical")
-    plt.xlim(left = 0, right = len(ave_grads))
-    plt.ylim(bottom = -0.001, top = 0.002) # zoom in on the lower gradient regions
-    plt.xlabel("Layers")
-    plt.ylabel("Average gradient")
-    plt.title("Gradient flow")
-    plt.grid(True)
-    plt.legend([Line2D([0], [0], color="c", lw = 4),
-                Line2D([0], [0], color="b", lw = 4),
-                Line2D([0], [0], color="k", lw = 4)], ['max-gradient', 'mean-gradient', 'zero-gradient'])
-    plt.tight_layout()
-    plt.savefig('GradientFlow.png')
+'''
+    10.13
+'''
+class dSSMVAE(nn.Module):
+    def __init__(self, act_dim, state_dim = 128, hidden_dim = 128) -> None:
+        super().__init__()
+
+        self.mlp_a = nn.Linear(act_dim, hidden_dim)
+        self.gru = GRUStack(hidden_dim, state_dim)
+        self.latent_z = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, state_dim * 2)
+        )
+
+
+    def step(self, s_prev, a_prev):
+        '''
+            z_t ~ p(z_t|s_t-1, a_t-1)
+            s_t = f(s_t-1, a_t-1)
+        '''
+        enc_a_prev = self.mlp_a(a_prev)
+        z_curr_p = self.latent_z(torch.cat([s_prev, enc_a_prev], -1))
+        z_curr_mu, z_curr_std = torch.chunk(z_curr_p, 2, -1)
+        z_curr_std = torch.sigmoid(z_curr_std) + 0.01
+        z_curr_dist = torch.distributions.Independent(torch.distributions.Normal(z_curr_mu, z_curr_std), 1)
+        z_curr = z_curr_dist.sample()
+        s_curr = self.gru(enc_a_prev, s_prev)
+        return z_curr_dist, (z_curr, s_curr)
+
+
+
+class sSSMVAE(nn.Module):
+    def __init__(self, act_dim, state_dim = 128, hidden_dim = 128) -> None:
+        super().__init__()
+
+        self.mlp_a = nn.Linear(act_dim, hidden_dim)
+        self.mlp_z = nn.Linear(state_dim, hidden_dim)
+        self.gru = GRUStack(hidden_dim * 2, state_dim)
+        self.latent_z = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, state_dim * 2)
+        )
+
+    
+    def step(self, s_prev, a_prev):
+        '''
+            z_t ~ p(z_t|s_t-1, a_t-1)
+            s_t = f(s_t-1, a_t-1, z_t)
+        '''
+        enc_a_prev = self.mlp_a(a_prev)
+        z_curr_p = self.latent_z(torch.cat([s_prev, enc_a_prev], -1))
+        z_curr_mu, z_curr_std = torch.chunk(z_curr_p, 2, -1)
+        z_curr_std = torch.sigmoid(z_curr_std) + 0.01
+        z_curr_dist = torch.distributions.Independent(torch.distributions.Normal(z_curr_mu, z_curr_std), 1)
+        z_curr = z_curr_dist.sample()
+
+        enc_z_curr = self.mlp_z(z_curr)
+        s_curr = self.gru(torch.cat([enc_a_prev, enc_z_curr], -1), s_prev)
+        return z_curr_dist, (z_curr, s_curr)
 
 
 
 if __name__ == '__main__':
-    # s = GRUStack(input_dim = 4, hidden_dim = 10, num_layers = 2)
-    # x = torch.zeros((3, 4))
-    # h = torch.zeros((3, 10))
-    # print(s(x, h).size())
-
-    # net = RSSM(obs_dim = 4, act_dim = 2, state_dim = 8, hidden_dim = 8, num_gru_layers = 2)
-    # h, s = net.init_states(3)
-    # batch_obs = torch.zeros((5, 3, 4))
-    # batch_act = torch.zeros((5, 3, 2))
-    # features, priors, posteriors = net(batch_obs, batch_act, h, s)
-    # print(features.size())
-    # print(priors.size())
-    # print(posteriors.size())
-
-    # model = WorldModel(obs_dim = 4, act_dim = 2, state_dim = 8, hidden_dim = 8, num_gru_layers = 2)
-    # h = torch.zeros((3, 8))
-    # s = torch.zeros((3, 8))
-    # batch_obs = torch.zeros((5, 3, 4))
-    # batch_act = torch.zeros((5, 3, 2))
-    # loss, loss_dict = model(batch_obs, batch_act, h, s)
-    # print(loss)
-    # print(loss_dict)
-
-    model = WorldModelA2C(
-        obs_dim = 4, 
-        act_dim = 2, 
-        state_dim = 8, 
-        hidden_dim = 8, 
-        num_gru_layers = 2,
-        min_state_std = 0.1, 
-        max_state_std = 1,
-        fixed_action_std = 0.5
-    )
-    actor_critic_params = model.get_parameter_dict()
-    optimizer = torch.optim.Adam([
-        {'params' : actor_critic_params['actor'], 'lr' : 0.0003},
-        {'params' : actor_critic_params['critic'], 'lr' : 0.001},
-        {'params' : actor_critic_params['worldmodel'], 'lr' : 0.0001},
-    ])
-
-    # # Test
-    # o_curr = torch.zeros((3, 4))
-    # a_prev = torch.zeros((3, 2))
-    # h_prev = torch.zeros((3, 8))
-    # s_prev = torch.zeros((3, 8))
-    # posterior, a, a_logprob, v, (h_curr, s_curr) = model.step(o_curr, a_prev, h_prev, s_prev, deterministic = False)
-
-    # batch_o_curr = torch.zeros((5, 3, 4))
-    # batch_a_prev = torch.zeros((5, 3, 2))
-    # features, priors, posteriors, recon_obs_curr, batch_a_dist, batch_a_logprob, batch_v_pred = model(batch_o_curr, batch_a_prev)
-
-    # z_t = torch.cat([h_prev, s_prev], -1)
-    # a_dist, a, a_logprob, v = model.actor_critic(z_t)
-
-
-    # Visualize gradient flow
-    batch_obs = torch.randn((10, 3, 4))
-    batch_next_obs = torch.randn((10, 3, 4))
-    batch_actions = torch.randn((10, 3, 2))
-    batch_action_logprobs = torch.randn((10, 3))
-    batch_returns = torch.randn((10, 3))
-    batch_advs = torch.randn((10, 3))
-    batch_traj_masks = torch.ones((10, 3))
-    _, priors, posteriors, recon_next_obs, batch_new_a_dist, batch_new_a_logprob, batch_v_pred = model(batch_next_obs, batch_actions)
-
-    # Clip loss
-    norm_advs = (batch_advs - batch_advs.mean()) / (batch_advs.std() + 1e-8)
-    ratio = (batch_new_a_logprob - batch_action_logprobs).exp()
-    surr1 = ratio * norm_advs
-    surr2 = torch.clamp(ratio, 1 - 0.2, 1 + 0.2) * norm_advs
-    clip_loss = -(torch.min(surr1, surr2) * batch_traj_masks).mean()
-
-    # Entropy loss
-    entropy_loss = -batch_new_a_dist.entropy().mean()
-
-    # KL divergence loss
-    priors_dist = model.rssm.create_diag_normal(priors)
-    posteriors_dist = model.rssm.create_diag_normal(posteriors)
-    kl_div_loss = torch.distributions.kl.kl_divergence(priors_dist, posteriors_dist).sum(0).mean()
-
-    # Reconstruction observation loss
-    recon_loss = 0.5 * (recon_next_obs - batch_next_obs).pow(2).sum([0, 2]).mean()
-
-    # Critic loss
-    critic_loss = 0.5 * ((batch_returns - batch_v_pred) * batch_traj_masks).pow(2).mean()
-
-    # Optimize
-    optimizer.zero_grad()
-    total_loss = clip_loss + entropy_loss + kl_div_loss + recon_loss + critic_loss
-    total_loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm = 0.05)
-    plot_grad_flow(model.named_parameters())
-    optimizer.step()
+    dssm = dSSMVAE(2, 8, 8)
+    sssm = sSSMVAE(2, 8, 8)
+    s = torch.zeros((3, 8))
+    a = torch.zeros((3, 2))
+    dssm.step(s, a)
+    sssm.step(s, a)

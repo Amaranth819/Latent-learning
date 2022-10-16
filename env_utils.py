@@ -21,28 +21,25 @@ class DummyVecEnv(object):
         self.env_max_steps = self.vec_envs[0]._max_episode_steps if hasattr(self.vec_envs[0], '_max_episode_steps') else 1000
 
         # Others
-        self.vec_obs = np.zeros((self.n_envs,) + self.obs_shape, dtype = np.float32)
-        self.vec_dones = np.zeros((self.n_envs), dtype = np.float32)
-        self.vec_rewards = np.zeros((self.n_envs), dtype = np.float32)
         self.vec_total_rewards = np.zeros((self.n_envs), dtype = np.float32)
         self.vec_total_steps = np.zeros((self.n_envs), dtype = np.float32)
+        self.vec_active = np.ones((self.n_envs), dtype = bool)
 
 
     def reset(self):
-        self.vec_obs.fill(0)
-        self.vec_dones.fill(0)
-        self.vec_rewards.fill(0)
         self.vec_total_rewards.fill(0)
         self.vec_total_steps.fill(0)
+        self.vec_active.fill(True)
 
-        for idx, env in enumerate(self.vec_envs):
-            self.vec_obs[idx] = env.reset()
+        vec_obs = []
+        for _, env in enumerate(self.vec_envs):
+            vec_obs.append(env.reset())
 
-        return self.vec_obs.copy()
+        return np.stack(vec_obs)
 
 
     def all_done(self):
-        return np.all(self.vec_dones)
+        return np.all(self.vec_active == False)
 
 
     def random_action(self):
@@ -54,27 +51,33 @@ class DummyVecEnv(object):
             Input:
                 action: [n_envs, act_dim]
             Output:
-                masked_action: [n_envs, act_dim]
                 masked_next_obs: [n_envs, obs_dim]
                 masked_rewards: [n_envs]
                 masked_dones: [n_envs]
         '''
+        vec_obs = []
+        vec_rewards = []
+
         for idx, a in enumerate(action):
-            if not self.vec_dones[idx]:
-                self.vec_obs[idx], self.vec_rewards[idx], self.vec_dones[idx], _ = self.vec_envs[idx].step(a)
-                self.vec_total_rewards[idx] += self.vec_rewards[idx]
+            if self.vec_active[idx]:
+                obs, r, done, _ = self.vec_envs[idx].step(a)
+                vec_obs.append(obs)
+                vec_rewards.append(r)
+
+                self.vec_active[idx] = not done
+                self.vec_total_rewards[idx] += r
                 self.vec_total_steps[idx] += 1
             else:
-                self.vec_obs[idx] = 0
-                self.vec_rewards[idx] = 0
+                vec_obs.append(np.zeros(self.obs_shape))
+                vec_rewards.append(0)
 
-        return self.vec_obs.copy(), self.vec_rewards.copy(), self.vec_dones.copy()
+        return np.stack(vec_obs), np.stack(vec_rewards), 1 - self.vec_active
 
 
 
 if __name__ == '__main__':
     n_envs = 5
-    envs = DummyVecEnv('HalfCheetah-v4', None, n_envs)
+    envs = DummyVecEnv('Ant-v4', None, n_envs)
 
     # for env in envs.vec_envs:
     #     print(env.model.body('bthigh').mass)
@@ -84,7 +87,7 @@ if __name__ == '__main__':
     while not envs.all_done():
         actions = np.array([envs.act_space.sample() for _ in range(n_envs)])
         next_obs, rewards, dones = envs.step(actions)
-        print(counter, dones)
+        # print(counter, dones)
         # print('----')
         # print(obs)
         # print(actions)

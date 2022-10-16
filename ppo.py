@@ -2,6 +2,8 @@ import os
 import gym
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from logger import Logger
 from data_buffer import RolloutBuffer
 from env_utils import DummyVecEnv
@@ -28,12 +30,16 @@ class PPO(object):
         max_state_std = 1.0,
         fixed_action_std = 0.5,
         batch_size = 16,
+        seq_len = 25,
+        collect_intervals = 20,
         repeat_batch = 2,
         epsilon = 0.2,
         gamma = 0.99,
         gae_lambda = 0.95,
         vloss_coef = 0.1,
         recon_obs_loss_coef = 0.1,
+        clip_loss_coef = 100.0,
+        actor_entropy_coef = 10.0,
         device = 'auto'
     ) -> None:
         self.env_id = env_id
@@ -48,6 +54,8 @@ class PPO(object):
         self.state_dim = state_dim
         self.n_envs = n_envs
         self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.collect_intervals = collect_intervals
         self.repeat_batch = repeat_batch
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -55,6 +63,8 @@ class PPO(object):
         self.fixed_action_std = fixed_action_std
         self.vloss_coef = vloss_coef
         self.recon_obs_loss_coef = recon_obs_loss_coef
+        self.clip_loss_coef = clip_loss_coef
+        self.actor_entropy_coef = actor_entropy_coef
 
         # Environment
         self.training_env = DummyVecEnv(env_id, env_class, n_envs)
@@ -106,13 +116,13 @@ class PPO(object):
                 actions = tensor_to_np(a_t)
                 next_obs, rewards, dones = self.training_env.step(actions)
 
-                env_mask = 1.0 - self.training_env.vec_dones
+                env_mask = self.training_env.vec_active
                 masked_actions = actions * env_mask[:, None]
                 masked_values = tensor_to_np(value_ts) * env_mask
                 masked_action_logprobs = tensor_to_np(action_logprobs_ts) * env_mask
 
                 self.buffer.add(
-                    obs, next_obs, masked_values, masked_actions, rewards, dones, masked_action_logprobs
+                    obs, next_obs, masked_actions, rewards, dones, masked_values, masked_action_logprobs
                 )
 
                 obs = next_obs
@@ -121,23 +131,26 @@ class PPO(object):
             # Compute returns and advantages
             obs_ts = np_to_tensor(obs, self.device)
             _, _, _, value_ts, (_, _) = self.actor_critic.step(obs_ts, a_t, h_t, s_t)
-            self.buffer.compute_return_and_advantage(tensor_to_np(value_ts), self.training_env.vec_dones)
+            self.buffer.finish_epoch(tensor_to_np(value_ts), 1 - self.training_env.vec_active, self.training_env.vec_total_steps)
 
-        return np.mean(self.training_env.vec_total_rewards), np.std(self.training_env.vec_total_rewards), np.mean(self.training_env.vec_total_steps), np.std(self.training_env.vec_total_steps)
+        return np.mean(self.training_env.vec_total_rewards), \
+            np.std(self.training_env.vec_total_rewards), \
+            np.mean(self.training_env.vec_total_steps), \
+            np.std(self.training_env.vec_total_steps)
 
 
-    def update(self, batch_obs, batch_next_obs, batch_actions, batch_action_logprobs, batch_returns, batch_advs, batch_traj_masks):
-        _, priors, posteriors, recon_next_obs, batch_new_a_dist, batch_new_a_logprob, batch_v_pred = self.actor_critic(batch_next_obs, batch_actions)
+    def update(self, batch_obs, batch_next_obs, batch_actions, batch_old_action_logprobs, batch_returns, batch_advs, batch_traj_masks):
+        features, priors, posteriors, batch_recon_obs_logprob, batch_new_action_logprob, batch_action_dist_entropy, batch_v_logprob = self.actor_critic(batch_next_obs, batch_actions, batch_returns)
 
         # Clip loss
         norm_advs = (batch_advs - batch_advs.mean()) / (batch_advs.std() + 1e-8)
-        ratio = (batch_new_a_logprob - batch_action_logprobs).exp()
+        ratio = (batch_new_action_logprob - batch_old_action_logprobs).exp()
         surr1 = ratio * norm_advs
         surr2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * norm_advs
-        clip_loss = -(torch.min(surr1, surr2) * batch_traj_masks).mean()
+        clip_loss = self.clip_loss_coef * -(torch.min(surr1, surr2) * batch_traj_masks).mean()
 
         # Entropy loss
-        entropy_loss = -batch_new_a_dist.entropy().mean()
+        entropy_loss = self.actor_entropy_coef * -batch_action_dist_entropy.mean()
 
         # KL divergence loss
         priors_dist = self.actor_critic.rssm.create_diag_normal(priors)
@@ -145,10 +158,10 @@ class PPO(object):
         kl_div_loss = torch.distributions.kl.kl_divergence(priors_dist, posteriors_dist).sum(0).mean()
 
         # Reconstruction observation loss
-        recon_loss = self.recon_obs_loss_coef * 0.5 * (recon_next_obs - batch_next_obs).pow(2).sum([0, 2]).mean()
+        recon_loss = self.recon_obs_loss_coef * -batch_recon_obs_logprob.sum(0).mean()
 
         # Critic loss
-        critic_loss = self.vloss_coef * 0.5 * ((batch_returns - batch_v_pred) * batch_traj_masks).pow(2).mean()
+        critic_loss = self.vloss_coef * -batch_v_logprob.sum(0).mean()
 
         # Optimize
         self.optimizer.zero_grad()
@@ -167,6 +180,7 @@ class PPO(object):
             'Critic loss' : critic_loss.item(),
             'Actor LR' : self.optimizer.param_groups[0]['lr'],
             'Critic LR' : self.optimizer.param_groups[1]['lr'],
+            'WorldModel LR' : self.optimizer.param_groups[2]['lr']
         }
 
 
@@ -180,7 +194,7 @@ class PPO(object):
 
         # Training
         for _ in range(self.repeat_batch):
-            for batch_obs_ts, batch_next_obs_ts, batch_actions_ts, batch_action_logprobs_ts, batch_returns_ts, batch_advs_ts, batch_traj_masks_ts in self.buffer.generate_training_data(self.batch_size, self.device, True):
+            for batch_obs_ts, batch_next_obs_ts, batch_actions_ts, batch_action_logprobs_ts, batch_returns_ts, batch_advs_ts, batch_traj_masks_ts in self.buffer.generate_sequential_data(self.seq_len, self.collect_intervals, self.device):
                 batch_training_info = self.update(batch_obs_ts, batch_next_obs_ts, batch_actions_ts, batch_action_logprobs_ts, batch_returns_ts, batch_advs_ts, batch_traj_masks_ts)
 
                 for tag, val in batch_training_info.items():
@@ -273,7 +287,7 @@ class PPO(object):
             os.makedirs(dirname)
 
         state_dict = {
-            'actor_critic' : self.actor_critic.state_dict(),
+            'worldmodela2c' : self.actor_critic.state_dict(),
             'optimizer' : self.optimizer.state_dict()
         }
         torch.save(state_dict, path)
@@ -281,8 +295,51 @@ class PPO(object):
 
     def load(self, PPO_pkl_path):
         state_dict = torch.load(PPO_pkl_path, map_location = self.device)
-        self.actor_critic.load_state_dict(state_dict['actor_critic'])
+        self.actor_critic.load_state_dict(state_dict['worldmodela2c'])
         self.optimizer.load_state_dict(state_dict['optimizer'])
         self.optimizer.param_groups[0]['lr'] = self.actor_lr
         self.optimizer.param_groups[1]['lr'] = self.critic_lr
+        self.optimizer.param_groups[2]['lr'] = self.worldmodel_lr
         print('Load from %s successfully!' % PPO_pkl_path)
+
+
+
+'''
+    Visualize gradient flow
+'''
+def plot_grad_flow(named_parameters):
+    '''Plots the gradients flowing through different layers in the net during training.
+    Can be used for checking for possible gradient vanishing / exploding problems.
+    
+    Usage: Plug this function in Trainer class after loss.backwards() as 
+    "plot_grad_flow(self.model.named_parameters())" to visualize the gradient flow'''
+    ave_grads = []
+    max_grads= []
+    layers = []
+    for n, p in named_parameters:
+        if(p.requires_grad) and ("bias" not in n):
+            layers.append(n)
+            ave_grads.append(p.grad.abs().mean())
+            max_grads.append(p.grad.abs().max())
+
+    plt.bar(np.arange(len(max_grads)), max_grads, alpha = 1, lw = 1, color="c")
+    plt.bar(np.arange(len(max_grads)), ave_grads, alpha = 1, lw = 1, color="b")
+    plt.hlines(0, 0, len(ave_grads) + 1, lw = 2, color="k")
+    plt.xticks(range(0, len(ave_grads), 1), layers, rotation="vertical")
+    plt.xlim(left = 0, right = len(ave_grads))
+    plt.ylim(bottom = -0.001) # zoom in on the lower gradient regions
+    plt.xlabel("Layers")
+    plt.ylabel("Average gradient")
+    plt.title("Gradient flow")
+    plt.grid(True)
+    plt.legend([Line2D([0], [0], color="c", lw = 4),
+                Line2D([0], [0], color="b", lw = 4),
+                Line2D([0], [0], color="k", lw = 4)], ['max-gradient', 'mean-gradient', 'zero-gradient'])
+    plt.tight_layout()
+    plt.savefig('GradientFlow.png')
+
+
+if __name__ == '__main__':
+    algo = PPO('HalfCheetah-v4', n_envs = 4)
+    algo.one_epoch()
+    plot_grad_flow(algo.actor_critic.cpu().named_parameters())

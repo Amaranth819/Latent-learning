@@ -28,12 +28,9 @@ class RolloutBuffer(object):
         self.next_obs = np.zeros((buffer_size, n_envs, obs_dim), dtype = np.float32)
         self.actions = np.zeros((buffer_size, n_envs, act_dim), dtype = np.float32)
         self.rewards = np.zeros((buffer_size, n_envs), dtype = np.float32)
-        self.returns = np.zeros((buffer_size, n_envs), dtype = np.float32)
         self.dones = np.zeros((buffer_size, n_envs), dtype = np.float32)
         self.values = np.zeros((buffer_size, n_envs), dtype = np.float32)
         self.action_logprobs = np.zeros((buffer_size, n_envs), dtype = np.float32)
-        self.advs = np.zeros((buffer_size, n_envs), dtype = np.float32)
-        self.traj_masks = np.zeros((buffer_size, n_envs), dtype = np.float32)
 
         self.pos = 0
         self.buffer_size = buffer_size
@@ -45,29 +42,29 @@ class RolloutBuffer(object):
         self.next_obs.fill(0)
         self.actions.fill(0)
         self.rewards.fill(0)
-        self.returns.fill(0)
         self.dones.fill(0)
         self.values.fill(0)
         self.action_logprobs.fill(0)
-        self.advs.fill(0)
-        self.traj_masks.fill(0)
         self.pos = 0
 
 
-
-    def add(self, ob, next_ob, value, action, reward, done, logprob):
+    def add(self, ob, next_ob, action, reward, done, value, action_logprob):
         self.obs[self.pos] = ob
         self.next_obs[self.pos] = next_ob
-        self.values[self.pos] = value
         self.actions[self.pos] = action
         self.rewards[self.pos] = reward
         self.dones[self.pos] = done
-        self.action_logprobs[self.pos] = logprob
+        self.values[self.pos] = value
+        self.action_logprobs[self.pos] = action_logprob
         self.pos += 1
 
 
-    def compute_return_and_advantage(self, last_values, last_dones):
+    def finish_epoch(self, last_values, last_dones, env_total_steps = None):
+        # Compute returns, advantages and trajectory masks
+
+        self.advs = np.zeros(self.values.shape)
         last_gae_lam = 0
+
         for s in reversed(range(self.pos)):
             if s == self.pos - 1:
                 next_not_done = 1.0 - last_dones
@@ -81,10 +78,11 @@ class RolloutBuffer(object):
             self.advs[s] = last_gae_lam
 
         self.returns = self.advs + self.values
-        self.traj_masks = self.returns != 0
+        self.traj_masks = 1 - self.dones
+        self.env_total_steps = env_total_steps
 
 
-    def generate_training_data(self, batch_size, device, is_sequential = True):
+    def generate_episodic_data(self, batch_size, device):
         obs_ts = np_to_tensor(self.obs[:self.pos], device)
         next_obs_ts = np_to_tensor(self.next_obs[:self.pos], device)
         actions_ts = np_to_tensor(self.actions[:self.pos], device)
@@ -93,36 +91,126 @@ class RolloutBuffer(object):
         advs_ts = np_to_tensor(self.advs[:self.pos], device)
         traj_masks_ts = np_to_tensor(self.traj_masks[:self.pos], device)
 
-        if is_sequential:
-            sampler = BatchSampler(SubsetRandomSampler(range(self.n_envs)), batch_size, False)
-            for env_indices in sampler:
-                batch_obs_ts = obs_ts[:, env_indices, ...]
-                batch_next_obs_ts = next_obs_ts[:, env_indices, ...]
-                batch_actions_ts = actions_ts[:, env_indices, ...]
-                batch_action_logprobs_ts = action_logprobs_ts[:, env_indices]
-                batch_returns_ts = returns_ts[:, env_indices]
-                batch_advs_ts = advs_ts[:, env_indices]
-                batch_traj_masks_ts = traj_masks_ts[:, env_indices]
-                yield batch_obs_ts, batch_next_obs_ts, batch_actions_ts, batch_action_logprobs_ts, batch_returns_ts, batch_advs_ts, batch_traj_masks_ts
-        else:
-            obs_ts = obs_ts.view(-1, self.obs_dim)
-            next_obs_ts = next_obs_ts.view(-1, self.obs_dim)
-            actions_ts = actions_ts.view(-1, self.act_dim)
-            action_logprobs_ts = action_logprobs_ts.view(-1)
-            returns_ts = returns_ts.view(-1)
-            advs_ts = advs_ts.view(-1)
-            traj_masks_ts = traj_masks_ts.view(-1)
+        sampler = BatchSampler(SubsetRandomSampler(range(self.n_envs)), batch_size, False)
+        for env_indices in sampler:
+            yield obs_ts[:, env_indices], \
+                next_obs_ts[:, env_indices], \
+                actions_ts[:, env_indices, ...], \
+                action_logprobs_ts[:, env_indices], \
+                returns_ts[:, env_indices], \
+                advs_ts[:, env_indices], \
+                traj_masks_ts[:, env_indices]
 
-            sampler = BatchSampler(SubsetRandomSampler(range(obs_ts.size(0))), batch_size, False)
-            for indices in sampler:
-                batch_obs_ts = obs_ts[indices, ...]
-                batch_next_obs_ts = next_obs_ts[indices, ...]
-                batch_actions_ts = actions_ts[indices, ...]
-                batch_action_logprobs_ts = action_logprobs_ts[indices]
-                batch_returns_ts = returns_ts[indices]
-                batch_advs_ts = advs_ts[indices]
-                batch_traj_masks_ts = traj_masks_ts[indices]
-                yield batch_obs_ts, batch_next_obs_ts, batch_actions_ts, batch_action_logprobs_ts, batch_returns_ts, batch_advs_ts, batch_traj_masks_ts
+
+    def generate_sequential_data(self, seq_len, num_sequential_samples, device):
+        obs_ts = np_to_tensor(self.obs[:self.pos], device)
+        next_obs_ts = np_to_tensor(self.next_obs[:self.pos], device)
+        actions_ts = np_to_tensor(self.actions[:self.pos], device)
+        action_logprobs_ts = np_to_tensor(self.action_logprobs[:self.pos], device)
+        returns_ts = np_to_tensor(self.returns[:self.pos], device)
+        advs_ts = np_to_tensor(self.advs[:self.pos], device)
+        traj_masks_ts = np_to_tensor(self.traj_masks[:self.pos], device)
+
+        for _ in range(num_sequential_samples):
+            batch_obs_ts = []
+            batch_next_obs_ts = []
+            batch_actions_ts = []
+            batch_action_logprobs_ts = []
+            batch_returns_ts = []
+            batch_advs_ts = []
+            batch_traj_masks_ts = []
+            for e in range(self.n_envs):
+                start_idx = np.random.randint(0, self.env_total_steps[e] - seq_len if self.env_total_steps[e] > seq_len else 1)
+                indices = np.arange(start_idx, start_idx + seq_len)
+                batch_obs_ts.append(obs_ts[indices, e])
+                batch_next_obs_ts.append(next_obs_ts[indices, e])
+                batch_actions_ts.append(actions_ts[indices, e])
+                batch_action_logprobs_ts.append(action_logprobs_ts[indices, e])
+                batch_returns_ts.append(returns_ts[indices, e])
+                batch_advs_ts.append(advs_ts[indices, e])
+                batch_traj_masks_ts.append(traj_masks_ts[indices, e])
+            yield torch.stack(batch_obs_ts, 1), \
+                torch.stack(batch_next_obs_ts, 1), \
+                torch.stack(batch_actions_ts, 1), \
+                torch.stack(batch_action_logprobs_ts, 1), \
+                torch.stack(batch_returns_ts, 1), \
+                torch.stack(batch_advs_ts, 1), \
+                torch.stack(batch_traj_masks_ts, 1)
+
+
+    def generate_transition_data(self, batch_size, device):
+        obs_ts = np_to_tensor(self.obs[:self.pos], device).view(-1, self.obs_dim)
+        next_obs_ts = np_to_tensor(self.next_obs[:self.pos], device).view(-1, self.obs_dim)
+        actions_ts = np_to_tensor(self.actions[:self.pos], device).view(-1, self.act_dim)
+        action_logprobs_ts = np_to_tensor(self.action_logprobs[:self.pos], device).view(-1)
+        returns_ts = np_to_tensor(self.returns[:self.pos], device).view(-1)
+        advs_ts = np_to_tensor(self.advs[:self.pos], device).view(-1)
+        traj_masks_ts = np_to_tensor(self.traj_masks[:self.pos], device).view(-1)
+
+        sampler = BatchSampler(SubsetRandomSampler(range(obs_ts.size(0))), batch_size, False)
+        for indices in sampler:
+            yield obs_ts[indices], next_obs_ts[indices], actions_ts[indices], action_logprobs_ts[indices], returns_ts[indices], advs_ts[indices], traj_masks_ts[indices]
+
+
+    # def generate_training_data(self, batch_size, device, seq_len = -1, num_sequential_samples = 20, is_episodic = True):
+    #     obs_ts = np_to_tensor(self.obs[:self.pos], device)
+    #     next_obs_ts = np_to_tensor(self.next_obs[:self.pos], device)
+    #     actions_ts = np_to_tensor(self.actions[:self.pos], device)
+    #     action_logprobs_ts = np_to_tensor(self.action_logprobs[:self.pos], device)
+    #     returns_ts = np_to_tensor(self.returns[:self.pos], device)
+    #     advs_ts = np_to_tensor(self.advs[:self.pos], device)
+    #     traj_masks_ts = np_to_tensor(self.traj_masks[:self.pos], device)
+
+    #     if is_episodic:
+    #         # Use the whole episode.
+    #         sampler = BatchSampler(SubsetRandomSampler(range(self.n_envs)), batch_size, False)
+    #         for env_indices in sampler:
+    #             yield obs_ts[:, env_indices], \
+    #                 next_obs_ts[:, env_indices], \
+    #                 actions_ts[:, env_indices, ...], \
+    #                 action_logprobs_ts[:, env_indices], \
+    #                 returns_ts[:, env_indices], \
+    #                 advs_ts[:, env_indices], \
+    #                 traj_masks_ts[:, env_indices]
+    #     else:
+    #         if seq_len > 0:
+    #             for _ in range(num_sequential_samples):
+    #                 batch_obs_ts = []
+    #                 batch_next_obs_ts = []
+    #                 batch_actions_ts = []
+    #                 batch_action_logprobs_ts = []
+    #                 batch_returns_ts = []
+    #                 batch_advs_ts = []
+    #                 batch_traj_masks_ts = []
+    #                 for e in range(self.n_envs):
+    #                     start_idx = np.random.randint(0, self.env_total_steps[e] - seq_len if self.env_total_steps[e] > seq_len else 1)
+    #                     indices = np.arange(start_idx, start_idx + seq_len)
+    #                     batch_obs_ts.append(obs_ts[indices, e])
+    #                     batch_next_obs_ts.append(next_obs_ts[indices, e])
+    #                     batch_actions_ts.append(actions_ts[indices, e])
+    #                     batch_action_logprobs_ts.append(action_logprobs_ts[indices, e])
+    #                     batch_returns_ts.append(returns_ts[indices, e])
+    #                     batch_advs_ts.append(advs_ts[indices, e])
+    #                     batch_traj_masks_ts.append(traj_masks_ts[indices, e])
+    #                 yield torch.stack(batch_obs_ts, 1), \
+    #                     torch.stack(batch_next_obs_ts, 1), \
+    #                     torch.stack(batch_actions_ts, 1), \
+    #                     torch.stack(batch_action_logprobs_ts, 1), \
+    #                     torch.stack(batch_returns_ts, 1), \
+    #                     torch.stack(batch_advs_ts, 1), \
+    #                     torch.stack(batch_traj_masks_ts, 1)
+    #         else:
+    #             obs_ts = obs_ts.view(-1, self.obs_dim)
+    #             next_obs_ts = next_obs_ts.view(-1, self.obs_dim)
+    #             actions_ts = actions_ts.view(-1, self.act_dim)
+    #             action_logprobs_ts = action_logprobs_ts.view(-1)
+    #             returns_ts = returns_ts.view(-1)
+    #             advs_ts = advs_ts.view(-1)
+    #             traj_masks_ts = traj_masks_ts.view(-1)
+
+    #             sampler = BatchSampler(SubsetRandomSampler(range(obs_ts.size(0))), batch_size, False)
+    #             for indices in sampler:
+    #                 yield obs_ts[indices], next_obs_ts[indices], actions_ts[indices], action_logprobs_ts[indices], returns_ts[indices], advs_ts[indices], traj_masks_ts[indices]
 
 
 # def merge_buffers_data(buffers : List[RolloutBuffer], device):
@@ -152,3 +240,14 @@ class RolloutBuffer(object):
 #     all_traj_masks = np_to_tensor(np.concatenate(all_traj_masks, 0), device)
 
 #     return all_obs, all_next_obs, all_actions, all_action_logprobs, all_returns, all_advs, all_traj_masks
+
+
+if __name__ == '__main__':
+    buf = RolloutBuffer(4, 100, 8, 3)
+    for _ in range(100):
+        buf.add(np.ones((4, 8)), np.ones((4, 8)), np.ones((4,3)), np.zeros(4), np.zeros(4), np.zeros(4), np.zeros(4))
+    steps = np.random.randint(0, 100, size = (4,))
+    print(steps)
+    buf.finish_epoch(np.zeros(4), np.zeros(4), steps)
+    for data in buf.generate_sequential_data(10, 2, torch.device('cpu')):
+        print(data[0].size())

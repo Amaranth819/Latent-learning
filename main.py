@@ -19,11 +19,11 @@ if __name__ == '__main__':
     ppo_parser.add_argument('--env_class', type = str, default = None)
 
     # Actor-Critic
-    ppo_parser.add_argument('--actor_lr', type = float, default = 0.0003)
-    ppo_parser.add_argument('--critic_lr', type = float, default = 0.001)
-    ppo_parser.add_argument('--worldmodel_lr', type = float, default = 0.0001)
+    ppo_parser.add_argument('--actor_lr', type = float, default = 0.0005)
+    ppo_parser.add_argument('--critic_lr', type = float, default = 0.0002)
+    ppo_parser.add_argument('--worldmodel_lr', type = float, default = 0.0003)
     ppo_parser.add_argument('--state_dim', type = int, default = 128)
-    ppo_parser.add_argument('--hidden_dim', type = int, default = 256)
+    ppo_parser.add_argument('--hidden_dim', type = int, default = 128)
     ppo_parser.add_argument('--num_gru_layers', type = int, default = 2)
     ppo_parser.add_argument('--fixed_action_std', type = float, default = 0.5)
     ppo_parser.add_argument('--min_state_std', type = float, default = 0.1)
@@ -31,12 +31,16 @@ if __name__ == '__main__':
 
     # Hyperparameters
     ppo_parser.add_argument('--batch_size', type = int, default = 16)
+    ppo_parser.add_argument('--seq_len', type = int, default = 25)
+    ppo_parser.add_argument('--collect_intervals', type = int, default = 20)
     ppo_parser.add_argument('--repeat_batch', type = int, default = 2)
     ppo_parser.add_argument('--epsilon', type = float, default = 0.2)
     ppo_parser.add_argument('--gamma', type = float, default = 0.99)
     ppo_parser.add_argument('--gae_lambda', type = float, default = 0.95)
     ppo_parser.add_argument('--vloss_coef', type = float, default = 0.1)
     ppo_parser.add_argument('--recon_obs_loss_coef', type = float, default = 0.1)
+    ppo_parser.add_argument('--clip_loss_coef', type = float, default = 100.0)
+    ppo_parser.add_argument('--actor_entropy_coef', type = float, default = 10.0)
     ppo_parser.add_argument('--device', type = str, default = 'auto')
 
     '''
@@ -47,7 +51,7 @@ if __name__ == '__main__':
     # Training settings
     training_parser.add_argument('--load_from_path', type = str, default = None)
     training_parser.add_argument('--save_root_dir', type = str, default = './WorldModelPPO/')
-    training_parser.add_argument('--epochs', type = int, default = 300)
+    training_parser.add_argument('--epochs', type = int, default = 100)
     training_parser.add_argument('--eval_frequency', type = int, default = None)
 
     '''
