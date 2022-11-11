@@ -1,1 +1,0 @@
-python -u main.py --load_from_path './WorldModelPPO/PPO.pkl' --epochs 0 --target_video_path 'curr.mp4'
