@@ -1,1 +1,0 @@
-python -u main.py --env_id 'HalfCheetah-v4' --num_hidden_layers 2 --epochs 1000 --eval_frequency 20
